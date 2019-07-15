@@ -1,8 +1,8 @@
 //========================================================================
-// GLFW 3.3 Win32 - www.glfw.org
+// GLFW 3.4 Win32 - www.glfw.org
 //------------------------------------------------------------------------
 // Copyright (c) 2002-2006 Marcus Geelnard
-// Copyright (c) 2006-2016 Camilla Löwy <elmindreda@glfw.org>
+// Copyright (c) 2006-2019 Camilla Löwy <elmindreda@glfw.org>
 //
 // This software is provided 'as-is', without any express or implied
 // warranty. In no event will the authors be held liable for any damages
@@ -23,6 +23,8 @@
 // 3. This notice may not be removed or altered from any source
 //    distribution.
 //
+//========================================================================
+// Please use C89 style variable declarations in this file because VS 2010
 //========================================================================
 
 #include "internal.h"
@@ -267,19 +269,11 @@ static void updateClipRect(_GLFWwindow* window)
         ClipCursor(NULL);
 }
 
-// Apply disabled cursor mode to a focused window
+// Enables WM_INPUT messages for the mouse for the specified window
 //
-static void disableCursor(_GLFWwindow* window)
+static void enableRawMouseMotion(_GLFWwindow* window)
 {
     const RAWINPUTDEVICE rid = { 0x01, 0x02, 0, window->win32.handle };
-
-    _glfw.win32.disabledCursorWindow = window;
-    _glfwPlatformGetCursorPos(window,
-                              &_glfw.win32.restoreCursorPosX,
-                              &_glfw.win32.restoreCursorPosY);
-    updateCursorImage(window);
-    _glfwCenterCursorInContentArea(window);
-    updateClipRect(window);
 
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
     {
@@ -288,11 +282,41 @@ static void disableCursor(_GLFWwindow* window)
     }
 }
 
+// Disables WM_INPUT messages for the mouse
+//
+static void disableRawMouseMotion(_GLFWwindow* window)
+{
+    const RAWINPUTDEVICE rid = { 0x01, 0x02, RIDEV_REMOVE, NULL };
+
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+    {
+        _glfwInputErrorWin32(GLFW_PLATFORM_ERROR,
+                             "Win32: Failed to remove raw input device");
+    }
+}
+
+// Apply disabled cursor mode to a focused window
+//
+static void disableCursor(_GLFWwindow* window)
+{
+    _glfw.win32.disabledCursorWindow = window;
+    _glfwPlatformGetCursorPos(window,
+                              &_glfw.win32.restoreCursorPosX,
+                              &_glfw.win32.restoreCursorPosY);
+    updateCursorImage(window);
+    _glfwCenterCursorInContentArea(window);
+    updateClipRect(window);
+
+    if (window->rawMouseMotion)
+        enableRawMouseMotion(window);
+}
+
 // Exit disabled cursor mode for the specified window
 //
 static void enableCursor(_GLFWwindow* window)
 {
-    const RAWINPUTDEVICE rid = { 0x01, 0x02, RIDEV_REMOVE, NULL };
+    if (window->rawMouseMotion)
+        disableRawMouseMotion(window);
 
     _glfw.win32.disabledCursorWindow = NULL;
     updateClipRect(NULL);
@@ -300,12 +324,6 @@ static void enableCursor(_GLFWwindow* window)
                               _glfw.win32.restoreCursorPosX,
                               _glfw.win32.restoreCursorPosY);
     updateCursorImage(window);
-
-    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
-    {
-        _glfwInputErrorWin32(GLFW_PLATFORM_ERROR,
-                             "Win32: Failed to remove raw input device");
-    }
 }
 
 // Returns whether the cursor is in the content area of the specified window
@@ -613,12 +631,8 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
             //       clicking a caption button
             if (HIWORD(lParam) == WM_LBUTTONDOWN)
             {
-                if (LOWORD(lParam) == HTCLOSE ||
-                    LOWORD(lParam) == HTMINBUTTON ||
-                    LOWORD(lParam) == HTMAXBUTTON)
-                {
+                if (LOWORD(lParam) != HTCLIENT)
                     window->win32.frameAction = GLFW_TRUE;
-                }
             }
 
             break;
@@ -814,15 +828,6 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
             const int x = GET_X_LPARAM(lParam);
             const int y = GET_Y_LPARAM(lParam);
 
-            // Disabled cursor motion input is provided by WM_INPUT
-            if (window->cursorMode == GLFW_CURSOR_DISABLED)
-                break;
-
-            _glfwInputCursorPos(window, x, y);
-
-            window->win32.lastCursorPosX = x;
-            window->win32.lastCursorPosY = y;
-
             if (!window->win32.cursorTracked)
             {
                 TRACKMOUSEEVENT tme;
@@ -836,18 +841,39 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
                 _glfwInputCursorEnter(window, GLFW_TRUE);
             }
 
+            if (window->cursorMode == GLFW_CURSOR_DISABLED)
+            {
+                const int dx = x - window->win32.lastCursorPosX;
+                const int dy = y - window->win32.lastCursorPosY;
+
+                if (_glfw.win32.disabledCursorWindow != window)
+                    break;
+                if (window->rawMouseMotion)
+                    break;
+
+                _glfwInputCursorPos(window,
+                                    window->virtualCursorPosX + dx,
+                                    window->virtualCursorPosY + dy);
+            }
+            else
+                _glfwInputCursorPos(window, x, y);
+
+            window->win32.lastCursorPosX = x;
+            window->win32.lastCursorPosY = y;
+
             return 0;
         }
 
         case WM_INPUT:
         {
-            UINT size;
+            UINT size = 0;
             HRAWINPUT ri = (HRAWINPUT) lParam;
-            RAWINPUT* data;
+            RAWINPUT* data = NULL;
             int dx, dy;
 
-            // Only process input when disabled cursor mode is applied
             if (_glfw.win32.disabledCursorWindow != window)
+                break;
+            if (!window->rawMouseMotion)
                 break;
 
             GetRawInputData(ri, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER));
@@ -913,6 +939,9 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
         case WM_ENTERSIZEMOVE:
         case WM_ENTERMENULOOP:
         {
+            if (window->win32.frameAction)
+                break;
+
             // HACK: Enable the cursor while the user is moving or
             //       resizing the window or using the window menu
             if (window->cursorMode == GLFW_CURSOR_DISABLED)
@@ -924,6 +953,9 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
         case WM_EXITSIZEMOVE:
         case WM_EXITMENULOOP:
         {
+            if (window->win32.frameAction)
+                break;
+
             // HACK: Disable the cursor once the user is done moving or
             //       resizing the window or using the menu
             if (window->cursorMode == GLFW_CURSOR_DISABLED)
@@ -1146,7 +1178,7 @@ static LRESULT CALLBACK windowProc(HWND hWnd, UINT uMsg,
             for (i = 0;  i < count;  i++)
             {
                 const UINT length = DragQueryFileW(drop, i, NULL, 0);
-                WCHAR* buffer = calloc(length + 1, sizeof(WCHAR));
+                WCHAR* buffer = calloc((size_t) length + 1, sizeof(WCHAR));
 
                 DragQueryFileW(drop, i, buffer, length + 1);
                 paths[i] = _glfwCreateUTF8FromWideStringWin32(buffer);
@@ -1693,7 +1725,7 @@ void _glfwPlatformSetWindowMonitor(_GLFWwindow* window,
 
     _glfwInputWindowMonitor(window, monitor);
 
-    if (monitor)
+    if (window->monitor)
     {
         MONITORINFO mi = { sizeof(mi) };
         UINT flags = SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOCOPYBITS;
@@ -1843,6 +1875,22 @@ void _glfwPlatformSetWindowOpacity(_GLFWwindow* window, float opacity)
         style &= ~WS_EX_LAYERED;
         SetWindowLongW(window->win32.handle, GWL_EXSTYLE, style);
     }
+}
+
+void _glfwPlatformSetRawMouseMotion(_GLFWwindow *window, GLFWbool enabled)
+{
+    if (_glfw.win32.disabledCursorWindow != window)
+        return;
+
+    if (enabled)
+        enableRawMouseMotion(window);
+    else
+        disableRawMouseMotion(window);
+}
+
+GLFWbool _glfwPlatformRawMouseMotionSupported(void)
+{
+    return GLFW_TRUE;
 }
 
 void _glfwPlatformPollEvents(void)
@@ -1999,24 +2047,26 @@ int _glfwPlatformCreateCursor(_GLFWcursor* cursor,
 
 int _glfwPlatformCreateStandardCursor(_GLFWcursor* cursor, int shape)
 {
-    LPCWSTR name = NULL;
+    int id = 0;
 
     if (shape == GLFW_ARROW_CURSOR)
-        name = IDC_ARROW;
+        id = OCR_NORMAL;
     else if (shape == GLFW_IBEAM_CURSOR)
-        name = IDC_IBEAM;
+        id = OCR_IBEAM;
     else if (shape == GLFW_CROSSHAIR_CURSOR)
-        name = IDC_CROSS;
+        id = OCR_CROSS;
     else if (shape == GLFW_HAND_CURSOR)
-        name = IDC_HAND;
+        id = OCR_HAND;
     else if (shape == GLFW_HRESIZE_CURSOR)
-        name = IDC_SIZEWE;
+        id = OCR_SIZEWE;
     else if (shape == GLFW_VRESIZE_CURSOR)
-        name = IDC_SIZENS;
+        id = OCR_SIZENS;
     else
         return GLFW_FALSE;
 
-    cursor->win32.handle = CopyCursor(LoadCursorW(NULL, name));
+    cursor->win32.handle = LoadImageW(NULL,
+                                      MAKEINTRESOURCEW(id), IMAGE_CURSOR, 0, 0,
+                                      LR_DEFAULTSIZE | LR_SHARED);
     if (!cursor->win32.handle)
     {
         _glfwInputErrorWin32(GLFW_PLATFORM_ERROR,
